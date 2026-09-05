@@ -1,18 +1,19 @@
 // server.js — a small, simple backend for Sirat.
-// This is the ONLY safe place to put your Anthropic API key.
-// Your app talks to this server. This server talks to Claude.
-
 const express = require('express');
 const cors = require('cors');
 const app = express();
 
-app.use(cors());              // lets your app's HTML talk to this server
-app.use(express.json());      // lets this server read JSON messages
+app.use(cors());
+app.use(express.json());
 
-// Put your real key in an environment variable — never type it directly here.
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 
+app.get('/', (req, res) => {
+  res.send(`Sirat backend is running. API key is ${API_KEY ? 'set' : 'MISSING'}.`);
+});
+
 app.post('/ask', async (req, res) => {
+  console.log('Received a question at', new Date().toISOString());
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -21,12 +22,15 @@ app.post('/ask', async (req, res) => {
         'x-api-key': API_KEY,
         'anthropic-version': '2023-06-01'
       },
-      body: JSON.stringify(req.body) // forwards whatever your app sent (system prompt, messages, etc.)
+      body: JSON.stringify(req.body)
     });
     const data = await response.json();
+    if (!response.ok) {
+      console.error('Anthropic API returned an error:', JSON.stringify(data));
+    }
     res.json(data);
   } catch (err) {
-    console.error(err);
+    console.error('Server crashed while asking Claude:', err);
     res.status(500).json({ error: 'Something went wrong reaching Claude.' });
   }
 });
