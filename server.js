@@ -1,6 +1,7 @@
 // server.js — a small, simple backend for Sirat.
 const express = require('express');
 const cors = require('cors');
+const https = require('https');
 const app = express();
 
 app.use(cors());
@@ -12,25 +13,41 @@ app.get('/', (req, res) => {
   res.send(`Sirat backend is running. API key is ${API_KEY ? 'set' : 'MISSING'}.`);
 });
 
-app.post('/ask', async (req, res) => {
-  console.log('Received a question at', new Date().toISOString());
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+function callClaude(payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const options = {
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
         'x-api-key': API_KEY,
         'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify(req.body)
+      }
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error('Could not parse Claude response: ' + data.slice(0, 200))); }
+      });
     });
-    const data = await response.json();
-    if (!response.ok) {
-      console.error('Anthropic API returned an error:', JSON.stringify(data));
-    }
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+app.post('/ask', async (req, res) => {
+  console.log('Received a question at', new Date().toISOString());
+  try {
+    const data = await callClaude(req.body);
     res.json(data);
   } catch (err) {
-    console.error('Server crashed while asking Claude:', err);
+    console.error('Server error while asking Claude:', err.message);
     res.status(500).json({ error: 'Something went wrong reaching Claude.' });
   }
 });
