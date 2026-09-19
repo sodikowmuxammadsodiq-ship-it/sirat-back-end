@@ -68,8 +68,19 @@ function callClaude(payload) {
 
 app.post('/ask', checkLimit, async (req, res) => {
   console.log('Received a question at', new Date().toISOString());
+
+  // Don't blindly trust the client — only forward the fields Sirat actually
+  // needs, with sane limits, so a modified/malicious request can't rack up
+  // cost by asking for a huge token count or an unapproved model.
+  const ALLOWED_MODELS = ['claude-sonnet-4-6'];
+  const model = ALLOWED_MODELS.includes(req.body.model) ? req.body.model : ALLOWED_MODELS[0];
+  const max_tokens = Math.min(Number(req.body.max_tokens) || 700, 1000);
+  const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
+  const payload = { model, max_tokens, messages };
+  if (req.body.system) payload.system = String(req.body.system).slice(0, 4000);
+
   try {
-    const data = await callClaude(req.body);
+    const data = await callClaude(payload);
     res.json(data);
   } catch (err) {
     console.error('Server error while asking Claude:', err.message);
