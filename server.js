@@ -1,4 +1,7 @@
 // server.js — a small, simple backend for Sirat.
+// This is the ONLY safe place to put your Anthropic API key.
+// Your app talks to this server. This server talks to Claude.
+
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
@@ -13,6 +16,28 @@ app.get('/', (req, res) => {
   res.send(`Sirat backend is running. API key is ${API_KEY ? 'set' : 'MISSING'}.`);
 });
 
+// --- Simple daily limit per visitor, to stop one person or a bot from ---
+// --- burning through your API credits. Resets naturally after 24h.   ---
+const DAILY_LIMIT = 40; // max questions per visitor per day — raise/lower as you like
+const usage = new Map(); // ip -> { count, resetAt }
+
+function checkLimit(req, res, next) {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  let entry = usage.get(ip);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + 24 * 60 * 60 * 1000 };
+  }
+  entry.count++;
+  usage.set(ip, entry);
+  if (entry.count > DAILY_LIMIT) {
+    return res.status(429).json({ error: { message: "You've reached today's question limit. Please try again tomorrow." } });
+  }
+  next();
+}
+
+// Uses Node's built-in https module directly, instead of fetch() —
+// more reliable for outbound HTTPS calls on some free hosting platforms.
 function callClaude(payload) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
@@ -41,7 +66,7 @@ function callClaude(payload) {
   });
 }
 
-app.post('/ask', async (req, res) => {
+app.post('/ask', checkLimit, async (req, res) => {
   console.log('Received a question at', new Date().toISOString());
   try {
     const data = await callClaude(req.body);
