@@ -16,6 +16,20 @@ app.get('/', (req, res) => {
   res.send(`Sirat backend is running. API key is ${API_KEY ? 'set' : 'MISSING'}.`);
 });
 
+// --- A shared "client secret" that only your own app's HTML knows. This  ---
+// --- is NOT real authentication (anyone could read it from your app's   ---
+// --- source code) — but it stops random scripts and scanners that never ---
+// --- looked at your app from hitting this endpoint at all. Combined     ---
+// --- with the daily limit below, it meaningfully raises the bar.        ---
+const CLIENT_SECRET = process.env.CLIENT_SECRET || 'sirat-app-2026';
+
+function checkClientSecret(req, res, next) {
+  if (req.headers['x-sirat-client'] !== CLIENT_SECRET) {
+    return res.status(403).json({ error: { message: 'Not authorized.' } });
+  }
+  next();
+}
+
 // --- Simple daily limit per visitor, to stop one person or a bot from ---
 // --- burning through your API credits. Resets naturally after 24h.   ---
 const DAILY_LIMIT = 40; // max questions per visitor per day — raise/lower as you like
@@ -66,7 +80,7 @@ function callClaude(payload) {
   });
 }
 
-app.post('/ask', checkLimit, async (req, res) => {
+app.post('/ask', checkClientSecret, checkLimit, async (req, res) => {
   console.log('Received a question at', new Date().toISOString());
 
   // Don't blindly trust the client — only forward the fields Sirat actually
