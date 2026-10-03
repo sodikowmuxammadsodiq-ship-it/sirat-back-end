@@ -1,28 +1,44 @@
-// server.js — a small, simple backend for Sirat.
-// This is the ONLY safe place to put your Anthropic API key.
-// Your app talks to this server. This server talks to Claude.
+// server.js — backend for Sirat.
+// Holds the Anthropic API key, now also handles Stripe payments and
+// checking subscription status via Supabase.
 
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
+const Stripe = require('stripe');
+const { createClient } = require('@supabase/supabase-js');
 const app = express();
 
 app.use(cors());
-app.use(express.json());
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://kadkemtrbvxwwqiekguy.supabase.co';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Where Stripe sends people back to after paying. Update these once the
+// app is hosted somewhere real (e.g. Netlify) — for now they default to
+// a placeholder so the server doesn't crash without them set.
+const APP_SUCCESS_URL = process.env.APP_SUCCESS_URL || 'https://example.com/index.html?subscribed=1';
+const APP_CANCEL_URL = process.env.APP_CANCEL_URL || 'https://example.com/index.html';
+
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+const supabaseAdmin = SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+  : null;
 
 app.get('/', (req, res) => {
-  res.send(`Sirat backend is running. API key is ${API_KEY ? 'set' : 'MISSING'}.`);
+  res.send(
+    `Sirat backend is running. ` +
+    `Anthropic key: ${API_KEY ? 'set' : 'MISSING'}. ` +
+    `Stripe: ${stripe ? 'set' : 'MISSING'}. ` +
+    `Supabase: ${supabaseAdmin ? 'set' : 'MISSING'}.`
+  );
 });
 
-// --- A shared "client secret" that only your own app's HTML knows. This  ---
-// --- is NOT real authentication (anyone could read it from your app's   ---
-// --- source code) — but it stops random scripts and scanners that never ---
-// --- looked at your app from hitting this endpoint at all. Combined     ---
-// --- with the daily limit below, it meaningfully raises the bar.        ---
+// --- A shared "client secret" that only your own app's HTML knows. ---
 const CLIENT_SECRET = process.env.CLIENT_SECRET || 'sirat-app-2026';
-
 function checkClientSecret(req, res, next) {
   if (req.headers['x-sirat-client'] !== CLIENT_SECRET) {
     return res.status(403).json({ error: { message: 'Not authorized.' } });
@@ -30,12 +46,37 @@ function checkClientSecret(req, res, next) {
   next();
 }
 
-// --- Simple daily limit per visitor, to stop one person or a bot from ---
-// --- burning through your API credits. Resets naturally after 24h.   ---
-const DAILY_LIMIT = 40; // max questions per visitor per day — raise/lower as you like
-const usage = new Map(); // ip -> { count, resetAt }
+// --- Figure out who's asking: reads the Supabase login token (if any) ---
+// --- sent by the frontend, and looks up whether they're subscribed.   ---
+async function identifyUser(req, res, next) {
+  req.user = null;
+  req.isSubscribed = false;
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ') && supabaseAdmin) {
+    const token = authHeader.slice(7);
+    try {
+      const { data, error } = await supabaseAdmin.auth.getUser(token);
+      if (!error && data.user) {
+        req.user = data.user;
+        const { data: profile } = await supabaseAdmin
+          .from('profiles')
+          .select('is_subscribed')
+          .eq('id', data.user.id)
+          .single();
+        req.isSubscribed = !!(profile && profile.is_subscribed);
+      }
+    } catch (e) {
+      console.error('Could not verify user token:', e.message);
+    }
+  }
+  next();
+}
 
+// --- Daily limit per visitor — skipped entirely for subscribed users. ---
+const DAILY_LIMIT = 40;
+const usage = new Map();
 function checkLimit(req, res, next) {
+  if (req.isSubscribed) return next(); // unlimited for subscribers
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
   let entry = usage.get(ip);
@@ -45,13 +86,11 @@ function checkLimit(req, res, next) {
   entry.count++;
   usage.set(ip, entry);
   if (entry.count > DAILY_LIMIT) {
-    return res.status(429).json({ error: { message: "You've reached today's question limit. Please try again tomorrow." } });
+    return res.status(429).json({ error: { message: "You've reached today's free question limit. Sign in and subscribe for unlimited questions." } });
   }
   next();
 }
 
-// Uses Node's built-in https module directly, instead of fetch() —
-// more reliable for outbound HTTPS calls on some free hosting platforms.
 function callClaude(payload) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
@@ -80,12 +119,75 @@ function callClaude(payload) {
   });
 }
 
-app.post('/ask', checkClientSecret, checkLimit, async (req, res) => {
-  console.log('Received a question at', new Date().toISOString());
+// --- Stripe webhook: Stripe calls this itself when a payment happens. ---
+// --- Must read the RAW body (not JSON-parsed) to verify the signature. ---
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET || !supabaseAdmin) {
+    return res.status(500).send('Webhook not configured.');
+  }
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature check failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
 
-  // Don't blindly trust the client — only forward the fields Sirat actually
-  // needs, with sane limits, so a modified/malicious request can't rack up
-  // cost by asking for a huge token count or an unapproved model.
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const userId = session.client_reference_id;
+      if (userId) {
+        await supabaseAdmin.from('profiles').update({
+          is_subscribed: true,
+          stripe_customer_id: session.customer
+        }).eq('id', userId);
+        console.log('Marked user as subscribed:', userId);
+      }
+    } else if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.updated') {
+      const sub = event.data.object;
+      const isActive = sub.status === 'active' || sub.status === 'trialing';
+      await supabaseAdmin.from('profiles').update({ is_subscribed: isActive }).eq('stripe_customer_id', sub.customer);
+      console.log('Updated subscription status for customer:', sub.customer, isActive);
+    }
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Error handling webhook:', err.message);
+    res.status(500).send('Webhook handler error.');
+  }
+});
+
+// Everything below this line reads JSON normally.
+app.use(express.json());
+
+// --- Starts a Stripe Checkout session — the frontend redirects the ---
+// --- person here to actually pay.                                  ---
+app.post('/create-checkout-session', checkClientSecret, identifyUser, async (req, res) => {
+  if (!stripe || !STRIPE_PRICE_ID) {
+    return res.status(500).json({ error: { message: 'Payments are not set up yet.' } });
+  }
+  if (!req.user) {
+    return res.status(401).json({ error: { message: 'Please sign in first.' } });
+  }
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
+      client_reference_id: req.user.id,
+      customer_email: req.user.email,
+      success_url: APP_SUCCESS_URL,
+      cancel_url: APP_CANCEL_URL
+    });
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('Error creating checkout session:', err.message);
+    res.status(500).json({ error: { message: 'Could not start checkout.' } });
+  }
+});
+
+app.post('/ask', checkClientSecret, identifyUser, checkLimit, async (req, res) => {
+  console.log('Received a question at', new Date().toISOString(), '| subscribed:', req.isSubscribed);
+
   const ALLOWED_MODELS = ['claude-sonnet-4-6'];
   const model = ALLOWED_MODELS.includes(req.body.model) ? req.body.model : ALLOWED_MODELS[0];
   const max_tokens = Math.min(Number(req.body.max_tokens) || 700, 1000);
