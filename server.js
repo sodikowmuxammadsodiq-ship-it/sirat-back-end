@@ -1,6 +1,5 @@
 // server.js — backend for Sirat.
-// Holds the Anthropic API key, now also handles Stripe payments and
-// checking subscription status via Supabase.
+// Supports both Google Gemini (free) and Anthropic Claude, plus Stripe and Supabase.
 
 const express = require('express');
 const cors = require('cors');
@@ -11,15 +10,13 @@ const app = express();
 
 app.use(cors());
 
-const API_KEY = process.env.ANTHROPIC_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://kadkemtrbvxwwqiekguy.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-// Where Stripe sends people back to after paying. Update these once the
-// app is hosted somewhere real (e.g. Netlify) — for now they default to
-// a placeholder so the server doesn't crash without them set.
 const APP_SUCCESS_URL = process.env.APP_SUCCESS_URL || 'https://example.com/index.html?subscribed=1';
 const APP_CANCEL_URL = process.env.APP_CANCEL_URL || 'https://example.com/index.html';
 
@@ -31,7 +28,8 @@ const supabaseAdmin = SUPABASE_SERVICE_ROLE_KEY
 app.get('/', (req, res) => {
   res.send(
     `Sirat backend is running. ` +
-    `Anthropic key: ${API_KEY ? 'set' : 'MISSING'}. ` +
+    `Gemini key: ${GEMINI_API_KEY ? 'set' : 'MISSING'}. ` +
+    `Anthropic key: ${ANTHROPIC_API_KEY ? 'set' : 'MISSING'}. ` +
     `Stripe: ${stripe ? 'set' : 'MISSING'}. ` +
     `Supabase: ${supabaseAdmin ? 'set' : 'MISSING'}.`
   );
@@ -47,7 +45,6 @@ function checkClientSecret(req, res, next) {
 }
 
 // --- Figure out who's asking: reads the Supabase login token (if any) ---
-// --- sent by the frontend, and looks up whether they're subscribed.   ---
 async function identifyUser(req, res, next) {
   req.user = null;
   req.isSubscribed = false;
@@ -76,7 +73,7 @@ async function identifyUser(req, res, next) {
 const DAILY_LIMIT = 40;
 const usage = new Map();
 function checkLimit(req, res, next) {
-  if (req.isSubscribed) return next(); // unlimited for subscribers
+  if (req.isSubscribed) return next();
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
   let entry = usage.get(ip);
@@ -91,6 +88,61 @@ function checkLimit(req, res, next) {
   next();
 }
 
+// --- Call Google Gemini API (Free) ---
+function callGemini(systemPrompt, messages) {
+  return new Promise((resolve, reject) => {
+    const contents = messages.map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }]
+    }));
+
+    const geminiPayload = {
+      contents: contents
+    };
+
+    if (systemPrompt) {
+      geminiPayload.systemInstruction = {
+        parts: [{ text: systemPrompt }]
+      };
+    }
+
+    const body = JSON.stringify(geminiPayload);
+    const options = {
+      hostname: 'generativelanguage.googleapis.com',
+      path: `/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) {
+            return reject(new Error(parsed.error.message || 'Gemini error'));
+          }
+          const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || "I'm sorry, I couldn't generate an answer.";
+          resolve({
+            content: [{ type: 'text', text: text }]
+          });
+        } catch (e) {
+          reject(new Error('Could not parse Gemini response: ' + data.slice(0, 200)));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// --- Call Claude API (Fallback if key is set) ---
 function callClaude(payload) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
@@ -101,7 +153,7 @@ function callClaude(payload) {
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
-        'x-api-key': API_KEY,
+        'x-api-key': ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01'
       }
     };
@@ -119,8 +171,7 @@ function callClaude(payload) {
   });
 }
 
-// --- Stripe webhook: Stripe calls this itself when a payment happens. ---
-// --- Must read the RAW body (not JSON-parsed) to verify the signature. ---
+// --- Stripe webhook ---
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET || !supabaseAdmin) {
     return res.status(500).send('Webhook not configured.');
@@ -157,11 +208,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   }
 });
 
-// Everything below this line reads JSON normally.
 app.use(express.json());
 
-// --- Starts a Stripe Checkout session — the frontend redirects the ---
-// --- person here to actually pay.                                  ---
+// --- Stripe Checkout ---
 app.post('/create-checkout-session', checkClientSecret, identifyUser, async (req, res) => {
   if (!stripe || !STRIPE_PRICE_ID) {
     return res.status(500).json({ error: { message: 'Payments are not set up yet.' } });
@@ -185,22 +234,33 @@ app.post('/create-checkout-session', checkClientSecret, identifyUser, async (req
   }
 });
 
+// --- Ask AI Endpoint ---
 app.post('/ask', checkClientSecret, identifyUser, checkLimit, async (req, res) => {
   console.log('Received a question at', new Date().toISOString(), '| subscribed:', req.isSubscribed);
 
-  const ALLOWED_MODELS = ['claude-sonnet-4-6'];
-  const model = ALLOWED_MODELS.includes(req.body.model) ? req.body.model : ALLOWED_MODELS[0];
-  const max_tokens = Math.min(Number(req.body.max_tokens) || 700, 1000);
   const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
-  const payload = { model, max_tokens, messages };
-  if (req.body.system) payload.system = String(req.body.system).slice(0, 4000);
+  const systemPrompt = req.body.system ? String(req.body.system).slice(0, 4000) : '';
 
   try {
-    const data = await callClaude(payload);
-    res.json(data);
+    if (GEMINI_API_KEY) {
+      const data = await callGemini(systemPrompt, messages);
+      return res.json(data);
+    }
+
+    if (ANTHROPIC_API_KEY) {
+      const ALLOWED_MODELS = ['claude-sonnet-4-6'];
+      const model = ALLOWED_MODELS.includes(req.body.model) ? req.body.model : ALLOWED_MODELS[0];
+      const max_tokens = Math.min(Number(req.body.max_tokens) || 700, 1000);
+      const payload = { model, max_tokens, messages };
+      if (systemPrompt) payload.system = systemPrompt;
+      const data = await callClaude(payload);
+      return res.json(data);
+    }
+
+    res.status(500).json({ error: { message: 'No AI key configured. Please set GEMINI_API_KEY on the backend.' } });
   } catch (err) {
-    console.error('Server error while asking Claude:', err.message);
-    res.status(500).json({ error: 'Something went wrong reaching Claude.' });
+    console.error('Server error while asking AI:', err.message);
+    res.status(500).json({ error: { message: err.message || 'Something went wrong reaching the AI.' } });
   }
 });
 
