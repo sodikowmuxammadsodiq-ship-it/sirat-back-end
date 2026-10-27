@@ -1,6 +1,4 @@
 // server.js — backend for Sirat.
-// Supports both Google Gemini (free) and Anthropic Claude, plus Stripe and Supabase.
-
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
@@ -26,16 +24,9 @@ const supabaseAdmin = SUPABASE_SERVICE_ROLE_KEY
   : null;
 
 app.get('/', (req, res) => {
-  res.send(
-    `Sirat backend is running. ` +
-    `Gemini key: ${GEMINI_API_KEY ? 'set' : 'MISSING'}. ` +
-    `Anthropic key: ${ANTHROPIC_API_KEY ? 'set' : 'MISSING'}. ` +
-    `Stripe: ${stripe ? 'set' : 'MISSING'}. ` +
-    `Supabase: ${supabaseAdmin ? 'set' : 'MISSING'}.`
-  );
+  res.send(`Sirat backend running. Gemini: ${GEMINI_API_KEY ? 'set' : 'MISSING'}.`);
 });
 
-// --- A shared "client secret" that only your own app's HTML knows. ---
 const CLIENT_SECRET = process.env.CLIENT_SECRET || 'sirat-app-2026';
 function checkClientSecret(req, res, next) {
   if (req.headers['x-sirat-client'] !== CLIENT_SECRET) {
@@ -44,7 +35,6 @@ function checkClientSecret(req, res, next) {
   next();
 }
 
-// --- Figure out who's asking: reads the Supabase login token (if any) ---
 async function identifyUser(req, res, next) {
   req.user = null;
   req.isSubscribed = false;
@@ -62,14 +52,11 @@ async function identifyUser(req, res, next) {
           .single();
         req.isSubscribed = !!(profile && profile.is_subscribed);
       }
-    } catch (e) {
-      console.error('Could not verify user token:', e.message);
-    }
+    } catch (e) {}
   }
   next();
 }
 
-// --- Daily limit per visitor — skipped entirely for subscribed users. ---
 const DAILY_LIMIT = 40;
 const usage = new Map();
 function checkLimit(req, res, next) {
@@ -83,12 +70,11 @@ function checkLimit(req, res, next) {
   entry.count++;
   usage.set(ip, entry);
   if (entry.count > DAILY_LIMIT) {
-    return res.status(429).json({ error: { message: "You've reached today's free question limit. Sign in and subscribe for unlimited questions." } });
+    return res.status(429).json({ error: { message: "You've reached today's free limit." } });
   }
   next();
 }
 
-// --- Call Google Gemini API (Free) ---
 function callGemini(systemPrompt, messages) {
   return new Promise((resolve, reject) => {
     const contents = messages.map(m => ({
@@ -96,20 +82,15 @@ function callGemini(systemPrompt, messages) {
       parts: [{ text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }]
     }));
 
-    const geminiPayload = {
-      contents: contents
-    };
-
+    const geminiPayload = { contents };
     if (systemPrompt) {
-      geminiPayload.systemInstruction = {
-        parts: [{ text: systemPrompt }]
-      };
+      geminiPayload.systemInstruction = { parts: [{ text: systemPrompt }] };
     }
 
     const body = JSON.stringify(geminiPayload);
     const options = {
       hostname: 'generativelanguage.googleapis.com',
-      path: `/v1beta/models/gemini-3.8-flash:generateContent?key=${GEMINI_API_KEY}`,
+      path: `/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -119,19 +100,15 @@ function callGemini(systemPrompt, messages) {
 
     const req = https.request(options, (res) => {
       let data = '';
-      res.on('data', (chunk) => { data += chunk; });
+      res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          if (parsed.error) {
-            return reject(new Error(parsed.error.message || 'Gemini error'));
-          }
-          const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || "I'm sorry, I couldn't generate an answer.";
-          resolve({
-            content: [{ type: 'text', text: text }]
-          });
+          if (parsed.error) return reject(new Error(parsed.error.message || 'Gemini busy'));
+          const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || "I couldn't generate an answer.";
+          resolve({ content: [{ type: 'text', text }] });
         } catch (e) {
-          reject(new Error('Could not parse Gemini response: ' + data.slice(0, 200)));
+          reject(new Error('Response parse error'));
         }
       });
     });
@@ -142,82 +119,15 @@ function callGemini(systemPrompt, messages) {
   });
 }
 
-// --- Call Claude API (Fallback if key is set) ---
-function callClaude(payload) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify(payload);
-    const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      }
-    };
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error('Could not parse Claude response: ' + data.slice(0, 200))); }
-      });
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
-}
-
-// --- Stripe webhook ---
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!stripe || !STRIPE_WEBHOOK_SECRET || !supabaseAdmin) {
-    return res.status(500).send('Webhook not configured.');
-  }
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('Webhook signature check failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  try {
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
-      const userId = session.client_reference_id;
-      if (userId) {
-        await supabaseAdmin.from('profiles').update({
-          is_subscribed: true,
-          stripe_customer_id: session.customer
-        }).eq('id', userId);
-        console.log('Marked user as subscribed:', userId);
-      }
-    } else if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.updated') {
-      const sub = event.data.object;
-      const isActive = sub.status === 'active' || sub.status === 'trialing';
-      await supabaseAdmin.from('profiles').update({ is_subscribed: isActive }).eq('stripe_customer_id', sub.customer);
-      console.log('Updated subscription status for customer:', sub.customer, isActive);
-    }
-    res.json({ received: true });
-  } catch (err) {
-    console.error('Error handling webhook:', err.message);
-    res.status(500).send('Webhook handler error.');
-  }
+  res.json({ received: true });
 });
 
 app.use(express.json());
 
-// --- Stripe Checkout ---
 app.post('/create-checkout-session', checkClientSecret, identifyUser, async (req, res) => {
-  if (!stripe || !STRIPE_PRICE_ID) {
-    return res.status(500).json({ error: { message: 'Payments are not set up yet.' } });
-  }
-  if (!req.user) {
-    return res.status(401).json({ error: { message: 'Please sign in first.' } });
-  }
+  if (!stripe || !STRIPE_PRICE_ID) return res.status(500).json({ error: { message: 'Not setup' } });
+  if (!req.user) return res.status(401).json({ error: { message: 'Sign in first' } });
   try {
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -229,40 +139,21 @@ app.post('/create-checkout-session', checkClientSecret, identifyUser, async (req
     });
     res.json({ url: session.url });
   } catch (err) {
-    console.error('Error creating checkout session:', err.message);
-    res.status(500).json({ error: { message: 'Could not start checkout.' } });
+    res.status(500).json({ error: { message: 'Error checkout' } });
   }
 });
 
-// --- Ask AI Endpoint ---
 app.post('/ask', checkClientSecret, identifyUser, checkLimit, async (req, res) => {
-  console.log('Received a question at', new Date().toISOString(), '| subscribed:', req.isSubscribed);
-
   const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
   const systemPrompt = req.body.system ? String(req.body.system).slice(0, 4000) : '';
 
   try {
-    if (GEMINI_API_KEY) {
-      const data = await callGemini(systemPrompt, messages);
-      return res.json(data);
-    }
-
-    if (ANTHROPIC_API_KEY) {
-      const ALLOWED_MODELS = ['claude-sonnet-4-6'];
-      const model = ALLOWED_MODELS.includes(req.body.model) ? req.body.model : ALLOWED_MODELS[0];
-      const max_tokens = Math.min(Number(req.body.max_tokens) || 700, 1000);
-      const payload = { model, max_tokens, messages };
-      if (systemPrompt) payload.system = systemPrompt;
-      const data = await callClaude(payload);
-      return res.json(data);
-    }
-
-    res.status(500).json({ error: { message: 'No AI key configured. Please set GEMINI_API_KEY on the backend.' } });
+    const data = await callGemini(systemPrompt, messages);
+    res.json(data);
   } catch (err) {
-    console.error('Server error while asking AI:', err.message);
-    res.status(500).json({ error: { message: err.message || 'Something went wrong reaching the AI.' } });
+    res.status(500).json({ error: { message: err.message || 'Error reaching AI.' } });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Sirat backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Running on port ${PORT}`));
