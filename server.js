@@ -90,7 +90,7 @@ function callGemini(systemPrompt, messages) {
     const body = JSON.stringify(geminiPayload);
     const options = {
       hostname: 'generativelanguage.googleapis.com',
-      path: `/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      path: `/v1beta/models/gemini-3.8-flash:generateContent?key=${GEMINI_API_KEY}`,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -104,7 +104,7 @@ function callGemini(systemPrompt, messages) {
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          if (parsed.error) return reject(new Error(parsed.error.message || 'Gemini busy'));
+          if (parsed.error) return reject(new Error(parsed.error.message || 'Gemini error'));
           const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || "I couldn't generate an answer.";
           resolve({ content: [{ type: 'text', text }] });
         } catch (e) {
